@@ -2,7 +2,7 @@
 
 An adaptive fraud, phishing, and scam detection platform. The system is being built incrementally across 13 phases (rule-based detection → sender/URL/reputation analysis → risk scoring → detection orchestration → plugin → agentic investigation → threat intelligence → adaptive learning → hardening/deployment).
 
-**This repository currently contains Phase 1 (project foundation), Phase 2 (SecurityEvent model and ingestion API), Phase 3 (rule-based detection engine), Phase 4 (sender and URL intelligence), and Phase 5 (risk scoring and decision engine).** No ML, agent, RAG, threat intelligence, or plugin exists yet — those arrive in later phases. What's here: the backend skeleton, a channel-independent `SecurityEvent` that can be ingested/validated/normalized/persisted, a deterministic detection layer (content rules + sender analysis + URL analysis) that produces structured *evidence*, and a deterministic `RiskEngine` that turns that evidence into a bounded, explainable risk *assessment* — still never a claim of "confirmed fraud."
+**This repository currently contains Phase 1 (project foundation), Phase 2 (SecurityEvent model and ingestion API), Phase 3 (rule-based detection engine), Phase 4 (sender and URL intelligence), Phase 5 (risk scoring and decision engine), and Phase 6 (confidence-based intelligence escalation).** No ML, agent, RAG, threat intelligence, or plugin exists yet — those arrive in later phases. What's here: the backend skeleton, a channel-independent `SecurityEvent` that can be ingested/validated/normalized/persisted, a deterministic detection layer (content rules + sender analysis + URL analysis) that produces structured *evidence*, a deterministic `RiskEngine` that turns that evidence into a bounded, explainable risk *assessment*, and an `EscalationPolicy`/`AnalysisOrchestrator` that decides whether that assessment is trustworthy enough to act on or whether the event should be routed toward a future, more expensive investigation stage — still never a claim of "confirmed fraud."
 
 ## SecurityEvent concept
 
@@ -271,6 +271,113 @@ Configurable via `ScoringPolicy.classification_thresholds` (validated to be cont
 
 > **The scoring policy and thresholds are initial deterministic heuristics and must be calibrated against a labeled evaluation dataset before production use.**
 
+## Escalation & Orchestration architecture
+
+```
+SecurityEvent
+      │
+      ▼
+DetectionEngine
+      │
+      ▼
+DetectionEvidence[]
+      │
+      ▼
+RiskEngine
+      │
+      ▼
+RiskAssessment
+      │
+      ▼
+EscalationPolicy
+      │
+      ├───────────────┐
+      ▼               ▼
+  Sufficient       Insufficient
+  evidence          evidence
+      │               │
+      ▼               ▼
+   DECIDE         ESCALATE
+                      │
+                      ▼
+             Future Intelligence
+             / Agent / ML / APIs   <- does not exist yet
+```
+
+Phase 5 answers "how risky is this event, and how confident are we?" Phase 6 answers a different question: **"is the current evidence sufficient to make a decision, or does this event need deeper — and more expensive — investigation?"** No such deeper investigation exists yet. This phase only builds the routing decision that a future agent/LLM/ML/external-intelligence stage would eventually be gated behind, so that expensive stage is only ever invoked for genuinely ambiguous events (see "Token-optimization implications" below).
+
+`AnalysisOrchestrator` (`app/orchestrator.py`, at the app root for the same reason `DetectionPipeline` is — it composes `app.detection` + `app.risk_scoring` + `app.escalation`, and none of those packages should import another) executes, in order: `DetectionEngine.evaluate()` → build `DetectionCoverage` from the detectors that ran → `RiskEngine.evaluate()` → `EscalationPolicy.evaluate()` → assemble one `AnalysisResult`. `DetectionPipeline` (Phase 5) is untouched; `AnalysisOrchestrator` is a separate, superset composition, not a replacement. Each detector executes exactly once — no retry loop, no recursive orchestrator call.
+
+### DetectionCoverage — knowing what actually ran
+
+`DetectionEngine.evaluate()` already isolated per-detector failures (try/except around each detector), but previously only logged a failure and silently continued — **the fact that a detector failed never left the function.** This phase closes that gap: `DetectionResult` (`app/detection/engine.py`) now also carries `detector_statuses: list[DetectorStatus]` (`app/detection/coverage.py` — `detector_name` + `SUCCEEDED`/`FAILED`), one entry per detector attempted. `DetectionCoverage` (`app/escalation/detection_coverage.py`) wraps that list and exposes `detectors_attempted`/`detectors_succeeded`/`detectors_failed`/`failed_detector_names`/`is_complete` as computed fields.
+
+This matters because **a failed detector is missing visibility, not evidence of absence.** If `URLAnalyzer` throws, that does not mean the event's URLs are safe — it means the system doesn't know. `EscalationPolicy` treats incomplete coverage as its own escalation reason, independent of how confident the surviving evidence happens to be.
+
+### EscalationPolicy — the decision logic
+
+`EscalationPolicy` (`app/escalation/escalation_policy.py`, a frozen, configurable Pydantic policy in the same style as `ScoringPolicy`) evaluates `(RiskAssessment, evidence, DetectionCoverage) -> EscalationDecision`. It checks, in order, and collects every reason that applies (the first one found is the primary `reason`; all are kept in `contributing_reasons`):
+
+1. `INSUFFICIENT_DETECTOR_COVERAGE` — any detector failed.
+2. `INSUFFICIENT_EVIDENCE` — fewer than `min_evidence_count` (default 1) evidence items.
+3. `HIGH_RISK_LOW_CONFIDENCE` — `risk_score ≥ high_risk_score_threshold` (default 70) **and** `confidence < confidence_threshold` (default 0.6).
+4. else `AMBIGUOUS_SIGNAL` — confidence is low and the classification is `SUSPICIOUS` (the band that is, by the classification thresholds themselves, the genuinely ambiguous middle).
+5. else `LOW_CONFIDENCE` — confidence is low, in any other band.
+
+If nothing triggers, the state is `NO_ESCALATION`. **Escalation is never a function of risk score alone or confidence alone** — it's the combination, plus coverage and evidence-count floors, that decides.
+
+**Evidence diversity and evidence quality are deliberately not re-checked here as separate signals.** `RiskAssessment.confidence` (Phase 5) already independently encodes both — 60% average evidence confidence, 40% correlation-group diversity ratio — so `confidence_threshold` transitively gates on them without duplicating that logic. `min_evidence_count` and `DetectionCoverage` cover the two dimensions confidence does *not* capture: a hard floor on raw evidence count, and "unknown because a detector didn't run" (the "presence of important unknowns" requirement).
+
+### The 5 required scenarios
+
+| # | risk_score | confidence | Classification | Decision | Reason | Priority |
+|---|---|---|---|---|---|---|
+| 1 | 15 | 0.95 | SAFE | `NO_ESCALATION` | — | — |
+| 2 | 88 | 0.95 | HIGH_RISK | `NO_ESCALATION` | — | — |
+| 3 | 58 | 0.45 | SUSPICIOUS | `ESCALATE` | `AMBIGUOUS_SIGNAL` | MEDIUM |
+| 4 | 82 | 0.52 | HIGH_RISK | `ESCALATE` | `HIGH_RISK_LOW_CONFIDENCE` | HIGH |
+| 5 | 25 | 0.35 | LOW_RISK | `ESCALATE` | `LOW_CONFIDENCE` | LOW |
+
+Case 2 is the important negative case: **high risk alone never triggers escalation.** A high-confidence `HIGH_RISK`/`CRITICAL` assessment is already actionable via `recommended_action` (`QUARANTINE`/`BLOCK`) — escalating it too would burn a future expensive investigation on an event the system already understands well. Case 5 is the other important case: **low risk does not default to "safe" when confidence is also low.** The policy distinguishes "probably safe" (case 1: low risk, high confidence) from "we don't know" (case 5: low risk, low confidence) — the latter still escalates.
+
+`priority` (`LOW`/`MEDIUM`/`HIGH`) is derived purely from `risk_score` band, independent of which reason(s) fired — how urgently a future queue should look at this event scales with how risky it currently looks, regardless of *why* the system is unsure. `recommended_next_stage` is `NONE` when not escalating and `DEEP_ANALYSIS` when escalating — the only tier this phase ever produces. `EXTERNAL_INTELLIGENCE`/`AGENT_INVESTIGATION` exist on the `NextStage` enum (`app/escalation/enums.py`) purely as a routing abstraction for future phases; no logic here selects between them yet, since no logic exists yet to justify choosing one over `DEEP_ANALYSIS`. Likewise `EscalationReason.NOVEL_SIGNAL` is defined but never produced — the interface a future novelty/anomaly detector would plug into, not novelty detection itself.
+
+### Example analysis result
+
+```json
+{
+  "event_id": "3f1b2c4a-1234-4a5b-9c6d-abcdef123456",
+  "risk_assessment": {
+    "risk_score": 58,
+    "confidence": 0.45,
+    "classification": "SUSPICIOUS",
+    "recommended_action": "WARN"
+  },
+  "detection_coverage": {
+    "detectors_attempted": 3,
+    "detectors_succeeded": 3,
+    "detectors_failed": 0,
+    "failed_detector_names": [],
+    "is_complete": true
+  },
+  "escalation": {
+    "state": "ESCALATE",
+    "requires_escalation": true,
+    "reason": "AMBIGUOUS_SIGNAL",
+    "contributing_reasons": ["AMBIGUOUS_SIGNAL"],
+    "priority": "MEDIUM",
+    "recommended_next_stage": "DEEP_ANALYSIS",
+    "current_risk_score": 58,
+    "current_confidence": 0.45,
+    "explanation": "Suspicious but insufficiently certain; the signal is ambiguous and warrants deeper investigation."
+  }
+}
+```
+
+### Token-optimization implications
+
+The whole point of this layered architecture — cheap deterministic detectors first, a pure-arithmetic risk/confidence calculation second, and only *then* a policy decision about whether more is needed — is that a future expensive stage (LLM/agent/external intelligence) would only ever be invoked for the subset of events `EscalationPolicy` marks `ESCALATE`. Case 2 above (`risk=88, confidence=0.95`) is the concrete proof this works: a clearly bad, well-corroborated event gets a `BLOCK`/`QUARANTINE` recommendation from cheap detectors alone and never reaches whatever expensive stage is built later. No token usage is calculated or invoked in this phase — this phase only establishes the gate that would make that saving real once something expensive exists behind it.
+
 ## Prerequisites
 
 - Python 3.11+ (developed against 3.14)
@@ -431,6 +538,7 @@ app/
 │   ├── rule.py                        # Rule Protocol + BaseRule
 │   ├── rule_engine.py                   # RuleEngine, RuleEngineResult
 │   ├── engine.py                          # Detector Protocol, DetectionResult, DetectionEngine
+│   ├── coverage.py                          # Phase 6: DetectorOutcome, DetectorStatus
 │   ├── registry.py                          # DEFAULT_RULES, build_default_rule_engine(), build_default_detectors()
 │   ├── rules/                                 # Phase 3: one file per content rule (7 files)
 │   ├── domain_similarity.py                     # Phase 4: DomainSimilarityAnalyzer (shared, bounded Levenshtein)
@@ -449,6 +557,12 @@ app/
 │   ├── classifier.py                      # classify(), recommend_action()
 │   └── risk_engine.py                       # RiskEngine.evaluate(evidence) -> RiskAssessment
 ├── pipeline.py                 # Phase 5: DetectionPipeline (app root -- composes app.detection + app.risk_scoring)
+├── escalation/                 # Phase 6: confidence-based escalation policy
+│   ├── enums.py                  # EscalationState, EscalationReason, EscalationPriority, NextStage
+│   ├── detection_coverage.py       # DetectionCoverage (wraps DetectorStatus[])
+│   ├── escalation_decision.py        # EscalationDecision
+│   └── escalation_policy.py            # EscalationPolicy, DEFAULT_ESCALATION_POLICY (self-validating)
+├── orchestrator.py             # Phase 6: AnalysisOrchestrator, AnalysisResult (app root -- composes detection + risk_scoring + escalation)
 ├── agent/                       # stub — later phase: agentic investigation
 ├── intelligence/                  # stub — later phase: threat intelligence
 └── learning/                        # stub — later phase: adaptive learning
@@ -484,7 +598,13 @@ tests/
 ├── test_scoring_policy.py                                                                 # Phase 5: policy self-validation
 ├── test_risk_engine.py                                                                      # Phase 5: end-to-end, explainability invariant
 ├── test_detection_pipeline.py                                                                # Phase 5: pipeline composition (stub + real engines)
-└── test_risk_scoring_security.py                                                              # Phase 5: no-network/DNS/file proofs for risk scoring
+├── test_risk_scoring_security.py                                                              # Phase 5: no-network/DNS/file proofs for risk scoring
+├── test_detection_coverage_tracking.py                                                          # Phase 6: DetectionEngine reports per-detector success/failure
+├── test_detection_coverage_model.py                                                               # Phase 6: DetectionCoverage computed fields
+├── escalation_fixtures.py                                                                           # Phase 6: make_risk_assessment()/coverage factories (not a test file)
+├── test_escalation_policy.py                                                                          # Phase 6: the 5 required cases, boundaries, determinism
+├── test_analysis_orchestrator.py                                                                        # Phase 6: composition, e2e, determinism, failure isolation
+└── test_escalation_security.py                                                                            # Phase 6: no-network/DNS/file proofs for escalation/orchestration
 ```
 
 The stub packages under `app/` contain only an `__init__.py` with a one-line docstring naming the phase that owns them. They exist so later phases have an agreed import location, not because anything is implemented there yet.
@@ -536,6 +656,16 @@ The stub packages under `app/` contain only an `__init__.py` with a one-line doc
 - **`DetectionPipeline` has no try/except of its own** — unlike `RuleEngine`/`DetectionEngine`, which isolate swappable, individually-optional plugins (rules/detectors), the pipeline chains exactly two already-internally-isolated deterministic stages; a failure there is a real bug with no sensible partial result, so it propagates rather than being silently logged-and-skipped.
 - **`RiskAssessment` deliberately carries no `event_id`** — stays a pure function of `list[DetectionEvidence]` only, trivially equality-testable. `PipelineResult` (from `DetectionPipeline`, not `RiskEngine`) is where `event_id` and the final assessment are seen together.
 
+**Phase 6**
+- **`DetectorStatus`/`DetectorOutcome` live in `app/detection/coverage.py`, not `app/escalation`** — `DetectionEngine` must be able to produce them, and `app/detection` (an earlier phase) must never depend on `app/escalation` (a later one). `DetectionCoverage` (in `app/escalation`) then wraps that same list rather than redefining it.
+- **`DetectionResult.detector_statuses` is a pure addition, not a redesign** — defaults to `[]`, so every pre-existing `DetectionResult` construction site and test stays valid unmodified. This closes a real, previously-silent gap: `DetectionEngine.evaluate()` already isolated per-detector failures internally but only logged them; a failure was never visible to a caller before this phase.
+- **Ordered-reasons-with-primary-first, not a single boolean check** — `EscalationPolicy.evaluate()` collects every triggered reason (coverage, evidence count, risk/confidence interaction) and exposes the most structurally significant one as `reason` while keeping the full list in `contributing_reasons`. This is what lets `INSUFFICIENT_DETECTOR_COVERAGE` win over a merely-low-confidence explanation when both are true — an incomplete picture is a more fundamental problem than an uncertain one.
+- **Evidence diversity/quality are not re-implemented in `EscalationPolicy`** — `RiskAssessment.confidence` (Phase 5) already independently encodes both; duplicating that logic here would violate the phase's own "avoid unnecessary complexity" instruction and risk the two computations silently drifting apart. `EscalationPolicy` adds exactly the two dimensions confidence cannot see: a hard evidence-count floor and detector coverage.
+- **`priority` is derived from `risk_score` band alone, not per-reason** — a single, small, table-free `if/elif` keeps priority meaning consistent ("how urgent to investigate") regardless of *why* the event is escalating, instead of needing a priority baked into every reason.
+- **`recommended_next_stage` only ever produces `NONE`/`DEEP_ANALYSIS` today** — `EXTERNAL_INTELLIGENCE`/`AGENT_INVESTIGATION` exist on the enum as the routing abstraction the objective explicitly asked for, but no logic here selects between them, since nothing exists yet to justify choosing one future stage over another.
+- **`AnalysisOrchestrator` is new, not a replacement for `DetectionPipeline`** — the two compositions coexist; `DetectionPipeline` remains the minimal `DetectionEngine → RiskEngine` composition from Phase 5, `AnalysisOrchestrator` is the superset that also produces `DetectionCoverage` and an `EscalationDecision`.
+- **No try/except in `AnalysisOrchestrator.evaluate()`**, same rationale as `DetectionPipeline`: `DetectionEngine` already isolates per-detector failures, and `RiskEngine`/`EscalationPolicy` are pure functions of already-computed inputs — a failure at the orchestration level itself is a real bug that should propagate, not be silently swallowed.
+
 ## Known limitations
 
 - **SQLite is a test-only stand-in for Postgres**, not a dialect-identical one. It's used because this dev environment has no Postgres/Docker available. Two concrete gaps: (1) `JSON` columns are generic on both dialects by choice, so there's no real JSONB indexing/containment querying yet on Postgres either — a future phase needing to query *inside* `headers`/`attachments` will need a `JSONB` column change (and, since `create_all()` can't alter existing tables, an Alembic migration at that point); (2) SQLite's `DATETIME` storage has no timezone-offset component, so a tz-aware value written to SQLite reads back naive — mitigated in `SecurityEventResponse` by re-attaching UTC to naive timestamps (a no-op on Postgres, where values are already aware), so the API contract stays consistently tz-aware regardless of which dialect served the read.
@@ -549,3 +679,7 @@ The stub packages under `app/` contain only an `__init__.py` with a one-line doc
 - **The scoring policy and thresholds are initial deterministic heuristics and must be calibrated against a labeled evaluation dataset before production use.** Severity weights, the correlation-group list, classification thresholds, and confidence weights were all chosen by worked-example reasoning (see the Risk Engine section above), not by fitting against real labeled fraud/phishing data — none exists yet in this project.
 - **`RiskEngine` has no API route in this phase** — like `DetectionEngine` before it, it's a standalone, independently-testable component; `DetectionPipeline` exists as a Python-level composition only, not yet exposed over HTTP.
 - **The correlation-group mechanism only catches the one case it was built for.** Two detectors that happen to agree for unrelated reasons (not via the shared `DomainSimilarityAnalyzer`) would not be grouped unless explicitly added to `ScoringPolicy.correlation_groups` — this is a configuration list, not a general-purpose "detect redundant evidence" algorithm.
+- **No expensive intelligence layer exists yet.** `NextStage.DEEP_ANALYSIS`/`EXTERNAL_INTELLIGENCE`/`AGENT_INVESTIGATION` and `EscalationReason.NOVEL_SIGNAL` are routing/interface abstractions only — nothing in this codebase calls an LLM, an agent, an ML model, or an external API in response to an `ESCALATE` decision. `AnalysisOrchestrator` produces the decision and stops.
+- **`EscalationPolicy`'s thresholds (`confidence_threshold=0.6`, `high_risk_score_threshold=70`, `min_evidence_count=1`) are initial heuristics, the same as Phase 5's scoring policy** — chosen by worked-example reasoning against the 5 required scenarios, not calibrated against labeled data. They should be tuned alongside `ScoringPolicy` once a labeled evaluation dataset exists.
+- **`EscalationPolicy` has no API route in this phase** — like `DetectionEngine`/`RiskEngine` before it, `AnalysisOrchestrator` is a standalone, independently-testable Python composition, not yet exposed over HTTP.
+- **Detector identity is `type(detector).__name__`**, not an explicit, independently-assigned name — if two different detector classes were ever named identically, their `DetectorStatus` entries would be indistinguishable by name alone. Not an issue with the current three detectors (`RuleEngine`, `SenderAnalyzer`, `URLAnalyzer`, all distinct classes), but worth revisiting if the detector list grows more dynamic.
