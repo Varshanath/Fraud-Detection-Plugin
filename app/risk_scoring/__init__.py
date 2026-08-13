@@ -1,1 +1,1 @@
-"""Reserved for a later phase — risk scoring and decision engine, kept separate from detection."""
+"""Deterministic risk scoring: DetectionEvidence[] -> RiskAssessment (score, confidence, classification, action)."""

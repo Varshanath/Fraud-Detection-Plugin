@@ -2,7 +2,7 @@
 
 An adaptive fraud, phishing, and scam detection platform. The system is being built incrementally across 13 phases (rule-based detection → sender/URL/reputation analysis → risk scoring → detection orchestration → plugin → agentic investigation → threat intelligence → adaptive learning → hardening/deployment).
 
-**This repository currently contains Phase 1 (project foundation), Phase 2 (SecurityEvent model and ingestion API), Phase 3 (rule-based detection engine), and Phase 4 (sender and URL intelligence).** No risk scoring, ML, agent, RAG, threat intelligence, or plugin exists yet — those arrive in later phases. What's here: the backend skeleton, a channel-independent `SecurityEvent` that can be ingested/validated/normalized/persisted, and a deterministic detection layer (content rules + sender analysis + URL analysis) that inspects an event and produces structured *evidence* — never a final verdict.
+**This repository currently contains Phase 1 (project foundation), Phase 2 (SecurityEvent model and ingestion API), Phase 3 (rule-based detection engine), Phase 4 (sender and URL intelligence), and Phase 5 (risk scoring and decision engine).** No ML, agent, RAG, threat intelligence, or plugin exists yet — those arrive in later phases. What's here: the backend skeleton, a channel-independent `SecurityEvent` that can be ingested/validated/normalized/persisted, a deterministic detection layer (content rules + sender analysis + URL analysis) that produces structured *evidence*, and a deterministic `RiskEngine` that turns that evidence into a bounded, explainable risk *assessment* — still never a claim of "confirmed fraud."
 
 ## SecurityEvent concept
 
@@ -58,7 +58,7 @@ class DetectionEvidence(BaseModel):
 - **Evidence** is a single rule's structured observation ("this text matched a credential-request pattern"), not a conclusion about the whole message.
 - **Severity** describes how serious *that one signal* is in isolation (e.g. an executable attachment is inherently more serious than a generic "click here"), not the event's overall risk.
 - **Confidence** is how strongly *that one rule* believes its own specific signal is genuinely present — never an overall phishing probability, never a final risk score, never an ML model's confidence (there is no ML in this phase).
-- **Classification** (SAFE / PHISHING / BLOCK / QUARANTINE) doesn't exist yet at all — it's produced later by the Risk Engine (Phase 5) from the evidence this engine collects.
+- **Classification** is a coarse, separate interpretation of the risk score — produced by the `RiskEngine` (see below), never by a detection rule.
 
 ### Implemented rules — content (`RuleEngine`, `app/detection/rules/`)
 
@@ -147,7 +147,129 @@ A small, hardcoded registry (`PayPal`, `Microsoft`, `Amazon`, `Google`, `Apple`,
 }
 ```
 
-No overall score, no verdict — just the structured evidence, ready for the Risk Engine to consume in a later phase.
+No overall score, no verdict at the detection layer — that's what `RiskEngine` computes next.
+
+## Risk Engine architecture
+
+```
+SecurityEvent
+      │
+      ▼
+DetectionEngine
+      │
+      ▼
+DetectionEvidence[]
+      │
+      ▼
+RiskEngine
+      │
+      ├── risk_score (0-100)
+      ├── confidence (0.0-1.0)
+      ├── classification (SAFE | LOW_RISK | SUSPICIOUS | HIGH_RISK | CRITICAL)
+      └── recommended_action (ALLOW | MONITOR | WARN | QUARANTINE | BLOCK)
+```
+
+`RiskEngine` (`app/risk_scoring/risk_engine.py`) is a pure function of `list[DetectionEvidence] → RiskAssessment` — no FastAPI, no SQLAlchemy, no network, no filesystem access, independently testable exactly like `RuleEngine`. `DetectionEngine` **discovers** evidence; `RiskEngine` **evaluates** it. The two are never merged into one class — a thin `DetectionPipeline` (`app/pipeline.py`, at the app root since it composes both `app.detection` and `app.risk_scoring` and neither package should import the other) sequences them: `DetectionPipeline().evaluate(event) -> PipelineResult(event_id, evidence, risk_assessment)`.
+
+### Evidence vs. risk score vs. confidence vs. classification vs. action
+
+Five genuinely different concepts, deliberately kept separate:
+- **Evidence** — one detector's specific observed signal (e.g. `LOOKALIKE_DOMAIN`).
+- **Risk score** (0-100) — an aggregate measure of how concerning the *event* is, computed from all evidence via a configurable policy.
+- **Confidence** (0.0-1.0) — how confident the system is in its *overall assessment*, based on evidence quality and independence. **Not** `risk_score / 100` — a system can be highly confident about a low-risk event, or only moderately confident about a high-risk one (see worked examples below).
+- **Classification** — a coarse, configurable bucketing of the risk score (SAFE/LOW_RISK/SUSPICIOUS/HIGH_RISK/CRITICAL).
+- **Recommended action** — derived **only** from classification (ALLOW/MONITOR/WARN/QUARANTINE/BLOCK), never computed directly from raw evidence.
+
+None of this is a final truth claim. There is no `CONFIRMED_FRAUD` classification anywhere in the system — only risk-assessment language, because this phase has no external verification or human review to actually confirm anything.
+
+### Scoring methodology
+
+Centralized, configurable **`ScoringPolicy`** (`app/risk_scoring/scoring_policy.py`, frozen Pydantic models with self-validation) — nothing about scoring is hard-coded inside individual rules.
+
+1. **Per-evidence contribution**: `contribution = severity_weight[severity] × evidence.confidence`, rounded to 2 decimals. Default severity weights: `LOW=10, MEDIUM=30, HIGH=55, CRITICAL=85`. Calibrated so a single perfect-confidence `CRITICAL` item alone lands at 85 (`HIGH_RISK`, not `CRITICAL`) — reaching `CRITICAL` genuinely requires multiple distinct, corroborating signals, not one strong one.
+2. **Correlated-evidence deduplication**: a configurable `rule_id → correlation_group` map. The default policy has exactly one non-trivial group: `"domain_lookalike": {LOOKALIKE_DOMAIN, LOOKALIKE_URL_DOMAIN}` — the same "this domain resembles a protected brand" fact, computed by the same `DomainSimilarityAnalyzer`, observed once via the sender and once via a URL. Within a correlation group, only the **highest**-contribution item counts; the rest are recorded in the breakdown as present but not counted, with a `suppressed_reason`. This is the only correlation mechanism — deliberately not a per-category cap (see below).
+3. **Final score**: `raw_score_before_cap = sum(contribution for counted items)`; `risk_score = floor(min(100, max(0, raw_score_before_cap)))`. `floor` (not `round()`) to avoid banker's-rounding surprises at classification-band boundaries and because it's always conservative.
+
+**"Category" and "correlation group" are two different axes, not the same thing.** A single bad URL can plausibly trigger six distinct `SUSPICIOUS_URL`-category rule_ids at once (`IP_ADDRESS_URL`, `OBFUSCATED_URL`, `SUSPICIOUS_QUERY_PARAMETER`, ...) — these are genuinely different structural facts about the URL, not the same fact twice, so they stay fully additive and are bounded only by the global 0-100 clamp. Collapsing "same category" the way "same correlation group" is collapsed would incorrectly suppress real, independent corroboration. Only `LOOKALIKE_DOMAIN`/`LOOKALIKE_URL_DOMAIN` are correlation-grouped today because they are the one case in the current rule set where two different detectors compute literally the same fact.
+
+**Explainability**: every `RiskAssessment` carries a `scoring_breakdown` (one entry per evidence item, counted or not, with its `rule_id`, `severity`, `evidence_confidence`, `severity_weight`, `contribution`, `correlation_group`, and `suppressed_reason` if applicable) plus `raw_score_before_cap`. This invariant always holds and is directly tested: `raw_score_before_cap == sum(entry.contribution for entry in scoring_breakdown if entry.counted)`, and `risk_score == floor(min(100, raw_score_before_cap))`.
+
+### Confidence methodology (independent of risk_score)
+
+`confidence = clamp(0.6 × avg_confidence_of_counted_evidence + 0.4 × group_diversity_ratio, 0, 1)` (weights configurable). `avg_confidence_of_counted_evidence` is the mean `.confidence` across post-dedup evidence (0.0 if none). `group_diversity_ratio = min(distinct_counted_correlation_groups / 4, 1.0)` — how many *independent* things agree, using correlation-group count (not detector count) so `RiskEngine` never needs to know how many detectors `DetectionEngine` happens to run.
+
+Proven independent of `risk_score` with two constructed cases:
+
+| Scenario | risk_score | classification | confidence |
+|---|---|---|---|
+| One `CRITICAL`, confidence 1.0 (single uncorroborated source) | 85 | HIGH_RISK | **0.70** |
+| Four independent `LOW`-severity items, confidence 0.95 each | 38 | LOW_RISK | **0.97** |
+
+The second row would give `confidence=0.38` if it were `risk_score/100` — it's `0.97` instead, because four independent, high-quality signals genuinely earn high confidence even though each individually contributes little risk. This is the literal opposite ordering of the two metrics, which is the point.
+
+**Documented gap**: the formula uses 2 of the 5 factors the user's brief listed (evidence confidence, source independence). "Evidence strength" (severity) is deliberately *excluded* from confidence — feeding severity into both risk and confidence would entangle them and undermine the required independence. "Consistency"/"absence of contradictory signals" is currently vacuous: no Phase 1-4 rule produces exculpatory/negative evidence, so there is nothing to contradict yet — this factor becomes meaningful once a future phase adds an allowlist-style or negative-evidence rule type.
+
+### Classification thresholds
+
+| Range | Classification |
+|---|---|
+| 0-19 | `SAFE` |
+| 20-39 | `LOW_RISK` |
+| 40-69 | `SUSPICIOUS` |
+| 70-89 | `HIGH_RISK` |
+| 90-100 | `CRITICAL` |
+
+Configurable via `ScoringPolicy.classification_thresholds` (validated to be contiguous and to cover exactly 0-100 — a malformed policy is structurally unrepresentable, not just conventionally avoided).
+
+### Action mapping
+
+| Classification | Recommended action |
+|---|---|
+| `SAFE` | `ALLOW` |
+| `LOW_RISK` | `MONITOR` |
+| `SUSPICIOUS` | `WARN` |
+| `HIGH_RISK` | `QUARANTINE` |
+| `CRITICAL` | `BLOCK` |
+
+`recommend_action(classification, policy)` takes **only** a classification — never evidence, never risk_score directly — enforced at the function signature level and tested.
+
+### Example risk assessment
+
+```json
+{
+  "risk_score": 63,
+  "confidence": 0.6,
+  "classification": "SUSPICIOUS",
+  "recommended_action": "WARN",
+  "raw_score_before_cap": 63.25,
+  "scoring_breakdown": [
+    {
+      "rule_id": "URGENCY_PRESSURE",
+      "category": "SOCIAL_ENGINEERING",
+      "severity": "HIGH",
+      "evidence_confidence": 0.5,
+      "severity_weight": 55,
+      "contribution": 27.5,
+      "correlation_group": "URGENCY_PRESSURE",
+      "counted": true,
+      "suppressed_reason": null
+    },
+    {
+      "rule_id": "CREDENTIAL_REQUEST",
+      "category": "CREDENTIAL_THEFT",
+      "severity": "HIGH",
+      "evidence_confidence": 0.65,
+      "severity_weight": 55,
+      "contribution": 35.75,
+      "correlation_group": "CREDENTIAL_REQUEST",
+      "counted": true,
+      "suppressed_reason": null
+    }
+  ]
+}
+```
+
+> **The scoring policy and thresholds are initial deterministic heuristics and must be calibrated against a labeled evaluation dataset before production use.**
 
 ## Prerequisites
 
@@ -318,7 +440,15 @@ app/
 │   ├── sender_rules/                                     # Phase 4: one file per sender rule (4 files)
 │   ├── url_analyzer.py                                     # Phase 4: URLAnalyzer (wraps an internal RuleEngine)
 │   └── url_rules/                                            # Phase 4: one file per URL rule (8 files)
-├── risk_scoring/              # stub — later phase: risk scoring / decision engine
+├── risk_scoring/              # Phase 5: risk scoring and decision engine
+│   ├── enums.py                 # RiskClassification, RecommendedAction
+│   ├── scoring_policy.py          # frozen Pydantic ScoringPolicy, DEFAULT_SCORING_POLICY (self-validating)
+│   ├── risk_assessment.py           # RiskAssessment, ScoringBreakdownEntry
+│   ├── risk_calculator.py             # evidence -> (risk_score, raw_score_before_cap, breakdown)
+│   ├── confidence_calculator.py         # breakdown -> confidence (independent of risk_score)
+│   ├── classifier.py                      # classify(), recommend_action()
+│   └── risk_engine.py                       # RiskEngine.evaluate(evidence) -> RiskAssessment
+├── pipeline.py                 # Phase 5: DetectionPipeline (app root -- composes app.detection + app.risk_scoring)
 ├── agent/                       # stub — later phase: agentic investigation
 ├── intelligence/                  # stub — later phase: threat intelligence
 └── learning/                        # stub — later phase: adaptive learning
@@ -345,7 +475,16 @@ tests/
 ├── test_detection_rule_ip_address_url.py, ...(×8)                         # Phase 4: one file per URL rule
 ├── test_sender_analyzer.py, test_url_analyzer.py                            # Phase 4: analyzer-level aggregation/isolation
 ├── test_detection_engine_phase4.py                                           # Phase 4: 3-detector wiring, isolation
-└── test_detection_fixture_cases_phase4.py                                      # Phase 4: sender/URL fixtures, mandated FPs
+├── test_detection_fixture_cases_phase4.py                                      # Phase 4: sender/URL fixtures, mandated FPs
+├── risk_fixtures.py                                                              # Phase 5: make_evidence() factory (not a test file)
+├── test_risk_calculator.py                                                         # Phase 5: per-severity/multi-evidence/bounds
+├── test_risk_correlation.py                                                         # Phase 5: correlation-group dedup, no inflation
+├── test_classifier.py                                                                 # Phase 5: exact threshold boundaries, action mapping
+├── test_confidence_calculator.py                                                        # Phase 5: independence-from-risk_score proofs
+├── test_scoring_policy.py                                                                 # Phase 5: policy self-validation
+├── test_risk_engine.py                                                                      # Phase 5: end-to-end, explainability invariant
+├── test_detection_pipeline.py                                                                # Phase 5: pipeline composition (stub + real engines)
+└── test_risk_scoring_security.py                                                              # Phase 5: no-network/DNS/file proofs for risk scoring
 ```
 
 The stub packages under `app/` contain only an `__init__.py` with a one-line docstring naming the phase that owns them. They exist so later phases have an agreed import location, not because anything is implemented there yet.
@@ -388,6 +527,15 @@ The stub packages under `app/` contain only an `__init__.py` with a one-line doc
 - **Similarity threshold (`0.85`) calibrated empirically**, not picked in the abstract: high enough that a plausible-but-unrelated word (`mypal.com` vs `paypal.com`, 0.80) does not cross it, low enough that every worked single-character-substitution example from the design brief (`paypa1`/`micros0ft`/`amaz0n`) scores a clean match. Documented here since "conservative" is inherently a judgment call, not a provable constant.
 - **No new runtime dependencies** — `urllib.parse` and `ipaddress` (both stdlib) cover all URL/IP parsing; `urllib.parse` specifically makes zero network calls (confirmed distinct from `urllib.request`, which remains forbidden), so it's safe to use freely under the existing "no network calls" invariant.
 
+**Phase 5**
+- **Additive-with-cap scoring, not a noisy-OR/probabilistic combination** — chosen specifically because it makes the explainability requirement mechanically, exactly verifiable (`raw_score_before_cap == sum(counted contributions)`) rather than only approximately true. A probabilistic combination would be more "principled" in isolation but would make per-entry contributions non-additive and much harder to prove consistent with the final score.
+- **`floor()`, not `round()`, for the final int score** — avoids Python's banker's-rounding surprises at classification-band boundaries and is always conservative (never rounds a score up into a higher band).
+- **Exactly one correlation group in the default policy** (`LOOKALIKE_DOMAIN` + `LOOKALIKE_URL_DOMAIN`) — deliberately not extended to other plausibly-related rule_ids (e.g. all `SUSPICIOUS_URL`-category rules), since those are genuinely different structural facts, not the same fact twice; over-grouping would suppress real corroborating evidence. "Category" and "correlation group" are documented as two different axes in the Risk Engine section above specifically to prevent this conflation.
+- **`ScoringPolicy` as frozen, self-validating Pydantic models**, not plain dataclasses or a config dict — makes "risk score never below 0 / never exceeds 100" and "action map covers all classifications" true by construction (a malformed policy fails to construct at all), not just true because the current tests happen to pass.
+- **Confidence deliberately omits "evidence strength" (severity) and is only trivially aware of "contradictory signals"** — both gaps are named explicitly rather than silently accepted: severity is excluded because feeding it into both risk and confidence would entangle the two and undermine the required independence; contradiction-awareness is vacuous today because no Phase 1-4 rule produces exculpatory evidence, so there is nothing yet to contradict.
+- **`DetectionPipeline` has no try/except of its own** — unlike `RuleEngine`/`DetectionEngine`, which isolate swappable, individually-optional plugins (rules/detectors), the pipeline chains exactly two already-internally-isolated deterministic stages; a failure there is a real bug with no sensible partial result, so it propagates rather than being silently logged-and-skipped.
+- **`RiskAssessment` deliberately carries no `event_id`** — stays a pure function of `list[DetectionEvidence]` only, trivially equality-testable. `PipelineResult` (from `DetectionPipeline`, not `RiskEngine`) is where `event_id` and the final assessment are seen together.
+
 ## Known limitations
 
 - **SQLite is a test-only stand-in for Postgres**, not a dialect-identical one. It's used because this dev environment has no Postgres/Docker available. Two concrete gaps: (1) `JSON` columns are generic on both dialects by choice, so there's no real JSONB indexing/containment querying yet on Postgres either — a future phase needing to query *inside* `headers`/`attachments` will need a `JSONB` column change (and, since `create_all()` can't alter existing tables, an Alembic migration at that point); (2) SQLite's `DATETIME` storage has no timezone-offset component, so a tz-aware value written to SQLite reads back naive — mitigated in `SecurityEventResponse` by re-attaching UTC to naive timestamps (a no-op on Postgres, where values are already aware), so the API contract stays consistently tz-aware regardless of which dialect served the read.
@@ -398,3 +546,6 @@ The stub packages under `app/` contain only an `__init__.py` with a one-line doc
 - **Rules are keyword/phrase/regex-based on English text only** — no stemming, no other-language support, no semantic/embedding matching (explicitly out of scope this phase). A rephrased attack that avoids every listed phrase and verb will not be flagged by this layer alone; that's expected — this is the cheap, fast, low-signal-noise first layer, not the whole detection story.
 - **`ProtectedBrandRegistry` covers only 7 brands** (PayPal, Microsoft, Amazon, Google, Apple, Netflix, LinkedIn) — explicitly test data standing in for a future real intelligence source (Phase 9), not exhaustive or authoritative. `DISPLAY_NAME_DOMAIN_MISMATCH`/`LOOKALIKE_DOMAIN`/`LOOKALIKE_URL_DOMAIN` cannot flag impersonation of any brand outside this list.
 - **No live/offline WHOIS, DNS, domain-age, or reputation data is used anywhere in Phase 4** — every sender/URL signal is derived purely from string structure already present on the ingested `SecurityEvent`. This is by design (explicitly forbidden this phase), not an oversight — it's what makes the whole detection layer through Phase 4 deterministic, offline, and side-effect-free.
+- **The scoring policy and thresholds are initial deterministic heuristics and must be calibrated against a labeled evaluation dataset before production use.** Severity weights, the correlation-group list, classification thresholds, and confidence weights were all chosen by worked-example reasoning (see the Risk Engine section above), not by fitting against real labeled fraud/phishing data — none exists yet in this project.
+- **`RiskEngine` has no API route in this phase** — like `DetectionEngine` before it, it's a standalone, independently-testable component; `DetectionPipeline` exists as a Python-level composition only, not yet exposed over HTTP.
+- **The correlation-group mechanism only catches the one case it was built for.** Two detectors that happen to agree for unrelated reasons (not via the shared `DomainSimilarityAnalyzer`) would not be grouped unless explicitly added to `ScoringPolicy.correlation_groups` — this is a configuration list, not a general-purpose "detect redundant evidence" algorithm.
