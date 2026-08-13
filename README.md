@@ -2,7 +2,7 @@
 
 An adaptive fraud, phishing, and scam detection platform. The system is being built incrementally across 13 phases (rule-based detection → sender/URL/reputation analysis → risk scoring → detection orchestration → plugin → agentic investigation → threat intelligence → adaptive learning → hardening/deployment).
 
-**This repository currently contains Phase 1 (project foundation) and Phase 2 (SecurityEvent model and ingestion API).** No detection logic, risk scoring, agent, ML, RAG, threat intelligence, or plugin exists yet — those arrive in later phases. What's here is the backend skeleton plus the platform's first real domain object: a channel-independent `SecurityEvent` that can be ingested, validated, normalized, and persisted.
+**This repository currently contains Phase 1 (project foundation), Phase 2 (SecurityEvent model and ingestion API), and Phase 3 (rule-based detection engine).** No risk scoring, sender/URL/reputation analysis, agent, ML, RAG, threat intelligence, or plugin exists yet — those arrive in later phases. What's here: the backend skeleton, a channel-independent `SecurityEvent` that can be ingested/validated/normalized/persisted, and a deterministic rule engine that inspects an event and produces structured *evidence* — never a final verdict.
 
 ## SecurityEvent concept
 
@@ -18,6 +18,79 @@ The platform is designed to eventually ingest security-relevant events from many
 Almost every field is optional except `event_type` — a URL-type event has no `subject`/`recipients`, an SMS event has no `sender_email`. `event_type` is stored as a plain string (not a native database enum), so adding a new channel later (e.g. `TEAMS`) is a code-only change, no migration required.
 
 **Ingestion is intentionally "dumb" by design**: it only validates, normalizes, and stores. It never fetches URLs, opens/executes attachments, makes external network calls, or treats event content as instructions — all content is untrusted data. Detection, scoring, and any AI/agent reasoning are later phases (`app/detection`, `app/risk_scoring`, `app/agent`), kept strictly separate from `app/ingestion`.
+
+## Rule Engine architecture
+
+```
+SecurityEvent → DetectionEngine → RuleEngine → Rules → DetectionEvidence
+```
+
+`RuleEngine` (`app/detection/rule_engine.py`) owns and runs a list of deterministic `Rule`s and collects whatever `DetectionEvidence` they produce — **it never computes an overall risk score and never decides SAFE/PHISHING/BLOCK/QUARANTINE.** Those are later phases (Risk Engine, decision engine). Each `Rule` (`app/detection/rule.py`, a `typing.Protocol`) inspects a `SecurityEvent` and returns **at most one** `DetectionEvidence`, never `True`/`False` and never a list — all matched phrases from one rule's evaluation are aggregated into that single object's `details`, which is what keeps one OTP request from producing five near-identical pieces of evidence.
+
+`DetectionEngine` (`app/detection/engine.py`) coordinates detection mechanisms; today it wraps `RuleEngine` only, but is built to accept additional detectors later (SenderAnalyzer, URLAnalyzer, ReputationAnalyzer, ML/anomaly/similarity detectors — none implemented yet) without any change to its own code — any object with `.evaluate(event) -> <something with .evidence>` plugs in. Both `RuleEngine` and `DetectionEngine` isolate failures: if one rule (or detector) raises, it's logged and skipped, the rest still run.
+
+New rules never require modifying `RuleEngine`: add a file under `app/detection/rules/`, add one instance to `DEFAULT_RULES` in `app/detection/registry.py`.
+
+### DetectionEvidence concept
+
+```python
+class DetectionEvidence(BaseModel):
+    rule_id: str
+    category: EvidenceCategory   # SOCIAL_ENGINEERING | CREDENTIAL_THEFT | FINANCIAL_FRAUD |
+                                  # SENSITIVE_INFORMATION_REQUEST | SUSPICIOUS_ATTACHMENT
+    severity: Severity           # LOW | MEDIUM | HIGH | CRITICAL
+    confidence: float            # 0.0-1.0
+    description: str
+    details: dict                # rule-specific, e.g. matched phrases / flagged attachments
+```
+
+**Evidence, severity, confidence, and final classification are four different things, and only the first three exist in this phase:**
+- **Evidence** is a single rule's structured observation ("this text matched a credential-request pattern"), not a conclusion about the whole message.
+- **Severity** describes how serious *that one signal* is in isolation (e.g. an executable attachment is inherently more serious than a generic "click here"), not the event's overall risk.
+- **Confidence** is how strongly *that one rule* believes its own specific signal is genuinely present — never an overall phishing probability, never a final risk score, never an ML model's confidence (there is no ML in this phase).
+- **Classification** (SAFE / PHISHING / BLOCK / QUARANTINE) doesn't exist yet at all — it's produced later by the Risk Engine (Phase 5) from the evidence this engine collects.
+
+### Implemented rules
+
+| `rule_id` | Category | Signal |
+|---|---|---|
+| `URGENCY_PRESSURE` | `SOCIAL_ENGINEERING` | Multi-word urgency/pressure phrases ("act immediately", "account will be suspended", "final warning"...) |
+| `CREDENTIAL_REQUEST` | `CREDENTIAL_THEFT` | A request verb (enter/provide/share/send/confirm...) co-occurring with a credential noun (password/OTP/PIN/verification code...) in the same sentence |
+| `FINANCIAL_REQUEST` | `FINANCIAL_FRAUD` | A request verb co-occurring with a financial noun (payment/bank details/card details/wire transfer...) |
+| `SENSITIVE_INFORMATION_REQUEST` | `SENSITIVE_INFORMATION_REQUEST` | A request verb co-occurring with an identity-verification noun (SSN, date of birth, passport number...) |
+| `SUSPICIOUS_CALL_TO_ACTION` | `SOCIAL_ENGINEERING` | Generic imperative phrases ("click here", "verify now", "unlock account"...); severity escalates on 3+ distinct phrases |
+| `IMPERSONATION_LANGUAGE` | `SOCIAL_ENGINEERING` | Generic institutional role-claim templates ("this is your bank", "on behalf of the delivery company"...) — no brand-name detection yet |
+| `SUSPICIOUS_ATTACHMENT_REFERENCE` | `SUSPICIOUS_ATTACHMENT` | Attachment **metadata only** (filename/content_type/size/sha256): executable/script/macro extensions, double extensions (`invoice.pdf.exe`) — never opens or reads attachment bytes |
+
+The `CREDENTIAL_REQUEST`/`FINANCIAL_REQUEST`/`SENSITIVE_INFORMATION_REQUEST` rules are **affirmative-only**: they fire only when a request verb genuinely co-occurs near the relevant noun, not merely when the noun is mentioned. `"Please use the OTP sent to your registered number."` does not trigger `CREDENTIAL_REQUEST` (no request verb — "use" is deliberately excluded), and `"Your payment of ₹500 was successful."` does not trigger `FINANCIAL_REQUEST` (no request verb near "payment") — both verified by dedicated tests using the exact wording from the design brief.
+
+### Example detection response
+
+```json
+{
+  "event_id": "3f1b2c4a-1234-4a5b-9c6d-abcdef123456",
+  "evidence": [
+    {
+      "rule_id": "URGENCY_PRESSURE",
+      "category": "SOCIAL_ENGINEERING",
+      "severity": "HIGH",
+      "confidence": 0.5,
+      "description": "Message contains urgency/pressure language commonly associated with social engineering.",
+      "details": {"matched_phrases": ["act immediately", "will be suspended"]}
+    },
+    {
+      "rule_id": "CREDENTIAL_REQUEST",
+      "category": "CREDENTIAL_THEFT",
+      "severity": "HIGH",
+      "confidence": 0.65,
+      "description": "Message requests that the recipient provide a password, OTP, PIN, or other login credential.",
+      "details": {"matched_phrases": ["password", "pin"]}
+    }
+  ]
+}
+```
+
+No overall score, no verdict — just the structured evidence, ready for the Risk Engine to consume in a later phase.
 
 ## Prerequisites
 
@@ -172,7 +245,15 @@ app/
 │   ├── schemas.py                  # Pydantic request/response schemas
 │   ├── normalization.py              # pure trim/lowercase/dedupe/tz functions, no I/O
 │   └── service.py                      # create_security_event, get_security_event
-├── detection/               # stub — Phase 3+: detection mechanisms
+├── detection/                # Phase 3: rule-based detection engine
+│   ├── enums.py                 # EvidenceCategory, Severity
+│   ├── evidence.py                # DetectionEvidence
+│   ├── matching.py                  # shared phrase/regex helpers + confidence formula, no I/O
+│   ├── rule.py                        # Rule Protocol + BaseRule
+│   ├── rule_engine.py                   # RuleEngine, RuleEngineResult
+│   ├── engine.py                          # Detector Protocol, DetectionResult, DetectionEngine
+│   ├── registry.py                          # DEFAULT_RULES, build_default_rule_engine()
+│   └── rules/                                 # one file per rule (7 files)
 ├── risk_scoring/              # stub — later phase: risk scoring / decision engine
 ├── agent/                       # stub — later phase: agentic investigation
 ├── intelligence/                  # stub — later phase: threat intelligence
@@ -186,7 +267,14 @@ tests/
 ├── test_security_event_schemas.py            # Pydantic validation tests
 ├── test_security_event_model.py                # ORM persistence tests (SQLite)
 ├── test_security_events_api.py                   # full-stack POST/GET tests
-└── test_security_events_security.py                # no-network-call / no-file-open proofs
+├── test_security_events_security.py                # no-network-call / no-file-open proofs (ingestion)
+├── detection_fixtures.py                             # 10 named SecurityEvent fixtures (not a test file)
+├── test_detection_evidence_schema.py                   # DetectionEvidence validation/immutability
+├── test_detection_rule_*.py (×7)                         # one file per rule, positive/negative/edge cases
+├── test_detection_rule_engine.py                            # registration, isolation, determinism
+├── test_detection_engine.py                                   # aggregation, future-detector accommodation
+├── test_detection_fixture_cases.py                              # all 10 fixtures through the full engine
+└── test_detection_security.py                                     # no-network-call / no-file-open proofs (detection)
 ```
 
 The stub packages under `app/` contain only an `__init__.py` with a one-line docstring naming the phase that owns them. They exist so later phases have an agreed import location, not because anything is implemented there yet.
@@ -210,9 +298,20 @@ The stub packages under `app/` contain only an `__init__.py` with a one-line doc
 - **`email-validator` added as a new dependency** — required for Pydantic's `EmailStr` to exist at all. Confirmed in pydantic's own source that `EmailStr` hardcodes `check_deliverability=False`, so validating an email address never triggers a DNS lookup or any other network call.
 - **No Alembic yet** — a single `init_db()` (`Base.metadata.create_all()`) is enough for one table with no migration history. Introduce Alembic once the model needs to change against a Postgres database that already holds data.
 
+**Phase 3**
+- **Rules consume `app.ingestion.schemas.SecurityEventResponse` directly**, not a new parallel model — it's already a plain, DB-free Pydantic object, so this satisfies "RuleEngine independent of the database" without inventing a duplicate schema that could drift out of sync. The coupling this creates (`app/detection → app/ingestion.schemas`) is one-directional onto a module with zero DB/session imports.
+- **`Rule` as a `typing.Protocol`**, not an ABC — structural typing, no forced inheritance; a `BaseRule` convenience class is available but optional.
+- **Each rule returns at most one `DetectionEvidence`, never a list** — this, combined with giving each rule category a distinct trigger vocabulary, is what makes duplicate near-identical evidence for one ask structurally impossible rather than needing dedup logic in `RuleEngine`.
+- **`SENSITIVE_INFORMATION_REQUEST` uses a vocabulary deliberately disjoint from `CREDENTIAL_REQUEST`/`FINANCIAL_REQUEST`** (identity-verification terms only — SSN, date of birth, passport number — never password/OTP/card/bank terms). This is a considered resolution of an internal tension in the original design brief (its own examples for this rule listed passwords/OTPs/card details, which overlap with the other two rules) in favor of the brief's explicit anti-duplication instruction.
+- **Context-aware "request" detection, not keyword presence**: `CREDENTIAL_REQUEST`/`FINANCIAL_REQUEST`/`SENSITIVE_INFORMATION_REQUEST` only fire when a request verb (enter/provide/share/confirm...) co-occurs with the relevant noun in the same sentence within a small word-gap window — affirmative pattern matching, not a keyword blocklist with hand-carved exceptions. This is what correctly excludes purely informational sentences ("use the OTP you were sent", "your payment was successful") without any message-specific special-casing.
+- **Rule and detector-level failure isolation**: both `RuleEngine.evaluate()` and `DetectionEngine.evaluate()` catch and log exceptions per rule/detector rather than letting one failure abort the whole batch — applied at both layers since a future ML/anomaly detector is more failure-prone than a regex rule.
+- **No new dependencies** — pure stdlib `re`/`enum` + the existing Pydantic stack, per the phase's own constraint against introducing ML/embeddings/vector-db/LLM libraries this early.
+
 ## Known limitations
 
 - **SQLite is a test-only stand-in for Postgres**, not a dialect-identical one. It's used because this dev environment has no Postgres/Docker available. Two concrete gaps: (1) `JSON` columns are generic on both dialects by choice, so there's no real JSONB indexing/containment querying yet on Postgres either — a future phase needing to query *inside* `headers`/`attachments` will need a `JSONB` column change (and, since `create_all()` can't alter existing tables, an Alembic migration at that point); (2) SQLite's `DATETIME` storage has no timezone-offset component, so a tz-aware value written to SQLite reads back naive — mitigated in `SecurityEventResponse` by re-attaching UTC to naive timestamps (a no-op on Postgres, where values are already aware), so the API contract stays consistently tz-aware regardless of which dialect served the read.
 - **`init_db()` is create-only.** It will not add/alter columns on a table that already exists. Fine for fresh test databases and fresh `docker compose up` bring-ups; once a Postgres instance holds real data, schema changes need Alembic, not another `init_db()` call.
 - **`recipients` has no per-entry format validation**, by design — its shape (email, phone number, username) depends on `event_type`, so only trimming/empty-filtering is applied, not email/phone validation.
 - **The live `uvicorn`/Docker Postgres path is unverified end-to-end in this environment** (no Postgres or Docker installed here). The full create→persist→retrieve cycle is verified via the SQLite-backed test suite (`tests/test_security_events_api.py`), and the ORM model's DDL was verified by generating it against a real (file-based) SQLite database and inspecting the resulting table/columns/indexes — but a live run against Postgres itself has not been performed and should be done before relying on this in a real deployment.
+- **The detection engine has no API route in this phase** — nothing in `app/api` calls `DetectionEngine` yet. It's a standalone, independently-testable Python component (matches the phase's own "keep detection independent of the UI/plugin" principle); wiring it into the ingestion flow or a dedicated endpoint is a later-phase decision, not made here.
+- **Rules are keyword/phrase/regex-based on English text only** — no stemming, no other-language support, no semantic/embedding matching (explicitly out of scope this phase). A rephrased attack that avoids every listed phrase and verb will not be flagged by this layer alone; that's expected — this is the cheap, fast, low-signal-noise first layer, not the whole detection story.
