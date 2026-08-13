@@ -6,7 +6,7 @@ from typing import Protocol
 from pydantic import BaseModel, Field
 
 from app.detection.evidence import DetectionEvidence
-from app.detection.registry import build_default_rule_engine
+from app.detection.registry import build_default_detectors
 from app.ingestion.schemas import SecurityEventResponse
 
 logger = logging.getLogger(__name__)
@@ -26,16 +26,16 @@ class DetectionResult(BaseModel):
 
 
 class DetectionEngine:
-    """Coordinates detection mechanisms. Currently wraps RuleEngine only, but is
-    designed so future detectors (SenderAnalyzer, URLAnalyzer, ReputationAnalyzer,
-    ML/anomaly/similarity detectors -- none implemented yet) can be added by
-    passing additional detectors in; this class's implementation does not
-    need to change.
+    """Coordinates detection mechanisms. By default runs RuleEngine,
+    SenderAnalyzer, and URLAnalyzer; designed so further detectors
+    (ReputationAnalyzer, ML/anomaly/similarity detectors -- none implemented
+    yet) can be added by passing additional detectors in; this class's
+    implementation does not need to change.
     """
 
     def __init__(self, detectors: Iterable[Detector] | None = None) -> None:
         self._detectors: list[Detector] = (
-            list(detectors) if detectors is not None else [build_default_rule_engine()]
+            list(detectors) if detectors is not None else build_default_detectors()
         )
 
     def evaluate(self, event: SecurityEventResponse) -> DetectionResult:

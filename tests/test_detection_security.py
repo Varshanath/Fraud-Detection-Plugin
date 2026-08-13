@@ -99,3 +99,66 @@ def test_content_is_treated_as_inert_data_not_instructions():
     # handling of the injection-style prefix, no instruction-following.
     assert "URGENCY_PRESSURE" in rule_ids
     assert "CREDENTIAL_REQUEST" in rule_ids
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 -- SenderAnalyzer / URLAnalyzer must never resolve DNS, connect to
+# a socket, or fetch anything, even though they parse and structurally
+# inspect domains and URLs.
+# ---------------------------------------------------------------------------
+
+
+def test_url_analysis_never_resolves_dns(monkeypatch):
+    def _raise_if_called(*args, **kwargs):
+        raise AssertionError("detection attempted a DNS lookup")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _raise_if_called)
+    monkeypatch.setattr(socket, "gethostbyname", _raise_if_called)
+
+    engine = DetectionEngine()
+    event = build_event(
+        urls=[
+            "http://192.168.1.10/login",
+            "https://paypa1.com/verify",
+            "https://login.verify.account.security.example.com/",
+        ]
+    )
+    result = engine.evaluate(event)
+    assert len(result.evidence) > 0
+
+
+def test_sender_analysis_never_resolves_dns(monkeypatch):
+    def _raise_if_called(*args, **kwargs):
+        raise AssertionError("detection attempted a DNS lookup")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _raise_if_called)
+    monkeypatch.setattr(socket, "gethostbyname", _raise_if_called)
+
+    engine = DetectionEngine()
+    event = build_event(
+        sender_display_name="PayPal Security",
+        sender_email="security@paypa1.com",
+        sender_domain="paypa1.com",
+        reply_to="reply@attacker.example",
+    )
+    result = engine.evaluate(event)
+    assert len(result.evidence) > 0
+
+
+def test_url_analysis_never_opens_a_real_network_socket(monkeypatch):
+    def _raise_if_called(*args, **kwargs):
+        raise AssertionError("detection attempted to open a network socket")
+
+    monkeypatch.setattr(socket.socket, "connect", _raise_if_called)
+
+    engine = DetectionEngine()
+    event = build_event(urls=["http://192.168.1.10/login", "https://paypa1.com/login"])
+    result = engine.evaluate(event)
+    assert len(result.evidence) > 0
+
+
+def test_urllib_parse_is_not_in_the_forbidden_module_set():
+    # urllib.parse is pure string parsing with zero network capability --
+    # distinct from urllib.request, which IS forbidden above.
+    assert "urllib.parse" not in _FORBIDDEN_MODULES
+    assert "urllib" in _FORBIDDEN_MODULES
