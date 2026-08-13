@@ -16,7 +16,9 @@
       "Bash(taskkill //F //PID 7808)",
       "Bash(docker --version)",
       "Bash(docker compose *)",
-      "Bash(docker info *)"
+      "Bash(docker info *)",
+      "Bash(./.venv/Scripts/pip.exe install *)",
+      "Bash(./.venv/Scripts/python.exe -c ' *)"
     ]
   }
 }

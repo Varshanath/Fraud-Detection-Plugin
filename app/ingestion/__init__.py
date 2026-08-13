@@ -1,1 +1,1 @@
-"""Reserved for Phase 2 — SecurityEvent model and ingestion API."""
+"""SecurityEvent domain model and ingestion API: receive, validate, normalize, persist."""
