@@ -5,6 +5,7 @@ class InvestigationStatus(str, Enum):
     COMPLETED = "COMPLETED"
     PARTIAL = "PARTIAL"
     FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
 
 
 class Uncertainty(str, Enum):

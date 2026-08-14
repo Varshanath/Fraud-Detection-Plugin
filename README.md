@@ -2,10 +2,10 @@
 
 Adaptive fraud/phishing/scam detection platform, built incrementally across 13 planned phases.
 
-- **Implemented (Phases 1-7)**: `SecurityEvent` ingestion, rule-based detection, sender/URL intelligence, risk scoring, confidence-based escalation, agent investigation.
+- **Implemented (Phases 1-8)**: `SecurityEvent` ingestion, rule-based detection, sender/URL intelligence, risk scoring, confidence-based escalation, agent investigation, real LLM-backed investigation reasoner.
 - **Not yet implemented**: ML, RAG, threat intelligence, browser/email plugin, adaptive learning.
-- **Pipeline**: `SecurityEvent → DetectionEngine → RiskEngine → EscalationPolicy → (if ESCALATE) AgentInvestigationEngine → RiskEngine (reassessment)`.
-- Detection produces *evidence*, never a verdict. The agent investigates but never decides the final action — `RiskEngine` is the only place a risk score is computed.
+- **Pipeline**: `SecurityEvent → DetectionEngine → RiskEngine → EscalationPolicy → (if ESCALATE) AgentInvestigationEngine [FakeAgentReasoner | LLMReasoner] → RiskEngine (reassessment)`.
+- Detection produces *evidence*, never a verdict. The agent — deterministic or LLM-backed — investigates but never decides the final action. **Final risk and action are always determined by the deterministic RiskEngine.**
 
 ## SecurityEvent
 
@@ -200,7 +200,34 @@ EscalationPolicy ── ESCALATE ──▶ AgentInvestigationEngine ──▶ In
 - **Budget**: `max_tool_calls=4` hard cap; truncation → `status=PARTIAL`. No loop/retry/recursion.
 - **Failure handling**: failing tool → `ToolResult(success=False)`, investigation continues; failing/malformed reasoner → `InvestigationResult(status=FAILED)`. `investigate()` never raises.
 - **Reassessment**: only when `investigation.recommended_reassessment` is `True` — `final_risk_assessment = RiskEngine.evaluate(initial_evidence + additional_evidence)`. Otherwise stays `None`. `AnalysisResult` always distinguishes initial vs. final.
-- **Token optimization**: `ContextDepth` defined but not yet enforced (no prompt is rendered). Real lever today: `select_tools_for()` + the escalation gate itself.
+- **Token optimization**: `ContextDepth` defined but not yet enforced by `FakeAgentReasoner` (no prompt is rendered). Real lever today: `select_tools_for()` + the escalation gate itself. `LLMReasoner` (below) is the first consumer of a rendered, bounded prompt.
+
+## Real LLM Investigation Reasoner
+
+```
+EscalationPolicy ── ESCALATE ──▶ AgentInvestigationEngine ──▶ LLMReasoner ──▶ AnthropicLLMClient (1 call)
+                                                                    │
+                                                        structured JSON, strictly validated
+                                                                    │
+                                                                    ▼
+                                                          Additional Evidence ──▶ RiskEngine ──▶ Final RiskAssessment
+```
+
+> **The LLM is an investigator, not the final security authority.**
+
+> **Final risk and action are always determined by the deterministic RiskEngine.**
+
+- `LLMReasoner` (`app/agent/llm_reasoner.py`) is a second `AgentReasoner` implementation, behind the exact same Protocol as `FakeAgentReasoner` — `AgentInvestigationEngine` doesn't know or care which one it's talking to. **`AgentInvestigationEngine()`'s own default is still `FakeAgentReasoner()`** — `LLMReasoner` is opt-in via `reasoner=build_reasoner(settings)`, not a new default.
+- **Provider**: Anthropic (`anthropic` SDK, Messages API) — the one supported provider, no provider registry/router/factory. `anthropic` is imported **lazily inside `AnthropicLLMClient.complete()`**, not at module level, so the test suite runs fully offline without the package installed.
+- **Configuration** (`app/config.py`, same `pydantic-settings` pattern as everything else): `LLM_ENABLED` (default `false`), `LLM_MODEL` (default `claude-sonnet-5`), `LLM_API_KEY` (`SecretStr`, never logged/repr'd), `LLM_TIMEOUT` (default 20s), `LLM_MAX_OUTPUT_TOKENS` (default 1024). `build_reasoner(settings)` is the only place enablement is decided: disabled, or enabled with no key → `DisabledLLMReasoner()` (no LLM call, returns a clearly-flagged skipped result — `InvestigationResult.status = SKIPPED`); enabled + key → real `LLMReasoner`. The application is fully functional with the LLM disabled.
+- **Targeted context**: `build_prompt()` (`app/agent/prompts.py`) renders 6 explicit, delimited sections — SYSTEM INSTRUCTIONS / INVESTIGATION OBJECTIVE / TRUSTED STRUCTURED CONTEXT (risk score, confidence, classification, escalation reason, detector coverage, existing evidence) / UNTRUSTED EVENT CONTENT / TOOL RESULTS / REQUIRED OUTPUT FORMAT. The full `SecurityEvent` is never sent — `ContentLimits` (`max_subject_chars`, `max_content_chars`, `max_urls`, `max_url_chars`, `max_evidence_items`, `max_tool_result_chars`) hard-caps everything, and truncation is recorded explicitly in the prompt (`content_truncated: true/false`) so the LLM is told, not left to assume, that it saw everything.
+- **Structured output**: the LLM must return one JSON object matching `LLMInvestigationResponse`/`LLMFinding` (strict Pydantic — enum-constrained `finding_type`/`severity`/`uncertainty`, `confidence` bounded 0.0-1.0, length-capped strings, capped finding count). **No `risk_score`/`classification`/`recommended_action` field exists in this schema** — the LLM is structurally incapable of setting them. Any validation failure (bad JSON, wrong enum, out-of-bounds value, oversized response) raises and is caught by `AgentInvestigationEngine`'s existing failure handling (Phase 7, unchanged) → `InvestigationResult(status=FAILED)`, never a crash.
+- **Prompt injection defense**: `wrap_untrusted_content()` delimits event content and neutralizes forged tags (Phase 7, reused). The LLM never receives tool-calling capability — it only ever sees already-executed `ToolResult`s as text and returns findings, so it cannot invent a new tool by construction, not just by instruction.
+- **One call, no loop**: `LLMReasoner.reason()` calls `client.complete()` **exactly once**. No retry, self-reflection, or planner loop.
+- **Evidence**: each validated finding becomes a real `DetectionEvidence` with an LLM-sourced `rule_id` (`AGENT_LLM_SENDER_ANALYSIS` / `AGENT_LLM_URL_ANALYSIS` / `AGENT_LLM_CONTENT_ANALYSIS` / `AGENT_LLM_INVESTIGATION`). LLM confidence is evidence confidence only — never a final phishing probability.
+- **Failure handling**: client timeout/auth/HTTP error/malformed/empty response — all caught, `investigation.status = FAILED`, the initial `RiskAssessment` is preserved, `final_risk_assessment` stays `None`. Never crashes.
+- **Privacy**: event content leaves the local process only when `LLM_ENABLED=true`. Logging records event_id/model/duration/finding-count/failure-category only — never the prompt, response, or API key.
+- **Caching**: not implemented this phase — the `AgentReasoner`/`LLMClient` seams mean a caching layer can wrap either later without changing `AgentInvestigationEngine`.
 
 ## Setup
 
@@ -274,6 +301,11 @@ curl -X POST http://localhost:8000/api/v1/security-events \
 | `DEBUG` | `true` | FastAPI debug mode |
 | `POSTGRES_USER` / `PASSWORD` / `HOST` / `PORT` / `DB` | `fraud_detection` / ... / `localhost` / `5432` / `fraud_detection` | Postgres connection |
 | `LOG_LEVEL` | `INFO` | Logging level |
+| `LLM_ENABLED` | `false` | Enables `LLMReasoner` (Anthropic); app runs fully without it |
+| `LLM_MODEL` | `claude-sonnet-5` | Model id passed to the Anthropic Messages API |
+| `LLM_API_KEY` | *(empty)* | Anthropic API key; required only if `LLM_ENABLED=true` |
+| `LLM_TIMEOUT` | `20` | LLM request timeout, seconds |
+| `LLM_MAX_OUTPUT_TOKENS` | `1024` | Hard output token cap per investigation |
 
 ## Project structure
 
@@ -290,19 +322,22 @@ app/
 ├── pipeline.py                  # Phase 5: DetectionPipeline (app root)
 ├── escalation/                   # Phase 6: EscalationPolicy, DetectionCoverage, EscalationDecision
 ├── orchestrator.py                # Phase 6-7: AnalysisOrchestrator, AnalysisResult (app root)
-├── agent/                          # Phase 7: agent investigation engine
+├── agent/                          # Phase 7-8: agent investigation engine
 │   ├── enums.py, models.py, context.py, tools.py, tool_registry.py, investigation.py, prompts.py, engine.py
+│   └── llm_reasoner.py               # Phase 8: LLMClient, AnthropicLLMClient, LLMReasoner, build_reasoner()
 ├── intelligence/                    # stub — later phase
 └── learning/                          # stub — later phase
 tests/
-├── conftest.py, detection_fixtures.py, risk_fixtures.py, escalation_fixtures.py, agent_fixtures.py   # fixtures
+├── conftest.py, detection_fixtures.py, risk_fixtures.py, escalation_fixtures.py, agent_fixtures.py,
+│   llm_fixtures.py                                                # fixtures
 ├── test_security_event_*.py, test_security_events_*.py         # Phase 2
 ├── test_detection_*.py, test_domain_similarity.py, test_protected_brand_registry.py,
 │   test_sender_analyzer.py, test_url_analyzer.py                # Phase 3-4
 ├── test_risk_*.py, test_classifier.py, test_confidence_calculator.py,
 │   test_scoring_policy.py, test_detection_pipeline.py            # Phase 5
 ├── test_escalation_*.py, test_analysis_orchestrator.py           # Phase 6
-└── test_agent_*.py, test_orchestrator_agent_integration.py       # Phase 7
+├── test_agent_*.py, test_orchestrator_agent_integration.py       # Phase 7
+└── test_llm_*.py, test_orchestrator_llm_integration.py           # Phase 8
 ```
 
 Stub packages under `app/` contain only an `__init__.py` naming the phase that owns them.
@@ -325,6 +360,11 @@ Stub packages under `app/` contain only an `__init__.py` naming the phase that o
 - The agent is invoked only from `AnalysisOrchestrator`; `EscalationPolicy`/`RiskEngine` stay agent-unaware.
 - `FakeAgentReasoner` reasons over structured tool data only, never rendered prompt text — makes injection structurally impossible.
 - Reassessment is gated on `recommended_reassessment`, not `ESCALATE` alone — avoids a duplicate assessment when nothing new is found.
+- `LLMReasoner` is a second `AgentReasoner`, not a replacement — `AgentInvestigationEngine`'s default stays `FakeAgentReasoner()`; `LLMReasoner` is opt-in via `build_reasoner(settings)`.
+- `anthropic` is imported lazily inside `AnthropicLLMClient.complete()`, not at module level — the test suite never needs the package installed.
+- The LLM's response schema has no risk/classification/action field at all — enforced structurally, not by prompt instruction alone.
+- The LLM gets no tool-calling capability — it only ever sees already-executed `ToolResult`s as text, so it cannot invent a new tool by construction.
+- `InvestigationStatus.SKIPPED` and `AgentReasoningResult.skipped` are additive, backward-compatible extensions of the Phase 7 contract (default `False`) — not a redesign.
 
 ## Known limitations
 
@@ -336,6 +376,9 @@ Stub packages under `app/` contain only an `__init__.py` naming the phase that o
 - **Scoring and escalation thresholds are initial heuristics, not calibrated against labeled data. The scoring policy and thresholds are initial deterministic heuristics and must be calibrated against a labeled evaluation dataset before production use.**
 - The correlation-group mechanism only catches the one case it was built for (not general redundant-evidence detection).
 - No expensive intelligence layer exists yet — `DEEP_ANALYSIS`/`EXTERNAL_INTELLIGENCE`/`AGENT_INVESTIGATION`/`NOVEL_SIGNAL` are unused routing abstractions.
-- No real LLM is configured anywhere — `FakeAgentReasoner` is fully deterministic and rule-based.
+- `FakeAgentReasoner` remains the default reasoner; `LLMReasoner` (Anthropic) exists but must be explicitly wired via `build_reasoner(settings)` — no code path enables it automatically.
 - The agent's tool set is fixed at 4 read-only tools; `max_tool_calls=4` is an uncalibrated heuristic.
+- `LLMReasoner` has not been exercised against a real Anthropic API call in this environment (no network access, no installed SDK) — verified via `FakeLLMClient` only; a live smoke test should be run before relying on this in production.
+- `ContentLimits` defaults (200/2000/10/300/15/1500 chars/items) are heuristics, not tuned against real token-cost data.
+- No caching layer exists yet — every escalated event that reaches `LLMReasoner` makes a fresh API call, even for a re-investigated/duplicate event.
 - None of `DetectionEngine`/`RiskEngine`/`EscalationPolicy`/`AgentInvestigationEngine` are exposed via an API route yet — reachable only through `AnalysisOrchestrator`.

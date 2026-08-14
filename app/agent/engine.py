@@ -167,11 +167,14 @@ class AgentInvestigationEngine:
 
         try:
             reasoning = self.reasoner.reason(context, tool_results)
-            status = (
-                InvestigationStatus.PARTIAL
-                if (budget_reached or any_tool_failed)
-                else InvestigationStatus.COMPLETED
-            )
+            if reasoning.skipped:
+                status = InvestigationStatus.SKIPPED
+            else:
+                status = (
+                    InvestigationStatus.PARTIAL
+                    if (budget_reached or any_tool_failed)
+                    else InvestigationStatus.COMPLETED
+                )
             result = InvestigationResult(
                 status=status,
                 summary=reasoning.summary,

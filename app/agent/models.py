@@ -45,6 +45,10 @@ class AgentReasoningResult(BaseModel):
     additional_evidence: list[DetectionEvidence] = Field(default_factory=list)
     uncertainty: Uncertainty
     recommended_reassessment: bool
+    # Phase 8: set by DisabledLLMReasoner (LLM_ENABLED=false) to distinguish
+    # "the reasoner investigated and found nothing" from "the reasoner never
+    # ran at all". Defaults False so every Phase 7 reasoner/test is unaffected.
+    skipped: bool = False
 
 
 class InvestigationResult(BaseModel):

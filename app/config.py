@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +22,15 @@ class Settings(BaseSettings):
     postgres_db: str = "fraud_detection"
 
     log_level: str = "INFO"
+
+    # Phase 8: real LLM investigation reasoner. SecretStr so the key can
+    # never leak via an accidental repr()/log of the Settings object. The
+    # application must remain fully functional with llm_enabled=False.
+    llm_enabled: bool = False
+    llm_model: str = "claude-sonnet-5"
+    llm_api_key: SecretStr | None = None
+    llm_timeout: float = 20.0
+    llm_max_output_tokens: int = 1024
 
     @property
     def database_url(self) -> str:
