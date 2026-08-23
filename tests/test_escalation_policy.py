@@ -1,5 +1,5 @@
 from app.escalation.enums import EscalationPriority, EscalationReason, EscalationState, NextStage
-from app.escalation.escalation_policy import default_escalation_policy
+from app.escalation.escalation_policy import EscalationPolicy, default_escalation_policy
 from app.risk_scoring.enums import RiskClassification
 from tests.escalation_fixtures import (
     complete_coverage,
@@ -61,12 +61,17 @@ def test_case5_low_risk_low_confidence_does_not_assume_safe():
     assert decision.priority == EscalationPriority.LOW
 
 
-def test_case5_variant_with_sparse_evidence_flags_insufficient_evidence():
+def test_case5_variant_with_zero_evidence_and_complete_coverage_is_clean():
+    # CLEAN/INCOMPLETE architecture: this test previously asserted ESCALATE
+    # via INSUFFICIENT_EVIDENCE for zero evidence + full coverage -- that was
+    # the zero-evidence-escalates defect. Zero evidence collected by fully
+    # successful detectors is now CLEAN, regardless of the (here synthetic,
+    # decoupled-from-evidence) risk/confidence values passed alongside it.
     assessment = make_risk_assessment(risk_score=25, confidence=0.35)
     decision = policy.evaluate(assessment, [], full_coverage)
-    assert decision.state == EscalationState.ESCALATE
-    assert decision.reason == EscalationReason.INSUFFICIENT_EVIDENCE
-    assert EscalationReason.LOW_CONFIDENCE in decision.contributing_reasons
+    assert decision.state == EscalationState.NO_ESCALATION
+    assert decision.reason is None
+    assert decision.contributing_reasons == []
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +142,65 @@ def test_full_coverage_with_high_confidence_low_risk_does_not_escalate():
 # ---------------------------------------------------------------------------
 
 
-def test_no_evidence_flags_insufficient_evidence():
-    assessment = make_risk_assessment(risk_score=0, confidence=0.0)
-    decision = policy.evaluate(assessment, [], full_coverage)
+def test_sparse_but_nonzero_evidence_below_floor_still_flags_insufficient_evidence():
+    # Distinguishes a genuine "some evidence, but not enough to trust" case
+    # from "zero evidence with complete coverage" (now CLEAN -- see the
+    # CLEAN/INCOMPLETE tests below). The evidence-count floor still applies
+    # whenever there IS some evidence, just not enough of it.
+    strict_policy = EscalationPolicy(
+        confidence_threshold=0.6,
+        high_risk_score_threshold=70,
+        medium_priority_score_threshold=40,
+        min_evidence_count=2,
+    )
+    single_item = [make_evidence(rule_id="A")]
+    assessment = make_risk_assessment(risk_score=25, confidence=0.35)
+    decision = strict_policy.evaluate(assessment, single_item, full_coverage)
     assert decision.state == EscalationState.ESCALATE
     assert decision.reason == EscalationReason.INSUFFICIENT_EVIDENCE
+
+
+# ---------------------------------------------------------------------------
+# CLEAN vs INCOMPLETE detection coverage
+#
+# Architectural rule: NO EVIDENCE != LOW CONFIDENCE, and DETECTOR FAILURE !=
+# CLEAN. Zero evidence collected while every detector succeeded means "we
+# looked and found nothing" (CLEAN) and must not escalate on its own. Zero
+# evidence while one or more detectors failed means detection coverage is
+# incomplete, which is a different, genuine reason to escalate.
+# ---------------------------------------------------------------------------
+
+
+def test_no_evidence_with_complete_coverage_is_clean_no_escalation():
+    # This test previously asserted ESCALATE via INSUFFICIENT_EVIDENCE --
+    # that was the exact zero-evidence-escalates defect (benign events with
+    # no detection hits were unnecessarily routed to the agent). Zero
+    # evidence from a fully successful detection pass is now CLEAN.
+    assessment = make_risk_assessment(risk_score=0, confidence=0.0)
+    decision = policy.evaluate(assessment, [], full_coverage)
+    assert decision.state == EscalationState.NO_ESCALATION
+    assert decision.requires_escalation is False
+    assert decision.reason is None
+    assert decision.recommended_next_stage == NextStage.NONE
+
+
+def test_no_evidence_with_incomplete_coverage_still_escalates():
+    # DETECTOR FAILURE != CLEAN: zero evidence must not be read as clean when
+    # detection coverage is incomplete -- it means "we don't know", not "we
+    # looked and found nothing". Escalates via the existing coverage policy.
+    assessment = make_risk_assessment(risk_score=0, confidence=0.0)
+    decision = policy.evaluate(
+        assessment, [], coverage_with_failures(["SenderAnalyzer"], ["RuleEngine", "URLAnalyzer"])
+    )
+    assert decision.state == EscalationState.ESCALATE
+    assert decision.reason == EscalationReason.INSUFFICIENT_DETECTOR_COVERAGE
+
+
+def test_no_evidence_with_all_detectors_failed_still_escalates():
+    assessment = make_risk_assessment(risk_score=0, confidence=0.0)
+    decision = policy.evaluate(assessment, [], coverage_with_failures(["RuleEngine", "SenderAnalyzer"]))
+    assert decision.state == EscalationState.ESCALATE
+    assert decision.reason == EscalationReason.INSUFFICIENT_DETECTOR_COVERAGE
 
 
 # ---------------------------------------------------------------------------

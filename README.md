@@ -155,10 +155,10 @@ RiskAssessment → EscalationPolicy ──┬── Sufficient evidence ──�
 - **DetectionCoverage** (`app/escalation/detection_coverage.py`): tracks per-detector success/failure (`DetectorStatus`, `app/detection/coverage.py`) instead of silently swallowing it. Exposes `detectors_attempted/succeeded/failed`, `failed_detector_names`, `is_complete`.
 - **EscalationPolicy** — `evaluate(RiskAssessment, evidence, DetectionCoverage) -> EscalationDecision`, checked in order:
   1. `INSUFFICIENT_DETECTOR_COVERAGE` — any detector failed
-  2. `INSUFFICIENT_EVIDENCE` — below `min_evidence_count` (default 1)
+  2. `INSUFFICIENT_EVIDENCE` — below `min_evidence_count` (default 1); **skipped when evidence is zero and every detector succeeded** — see [CLEAN vs INCOMPLETE detection coverage](#clean-vs-incomplete-detection-coverage)
   3. `HIGH_RISK_LOW_CONFIDENCE` — risk ≥ 70 and confidence < 0.6
   4. `AMBIGUOUS_SIGNAL` — confidence < 0.6, classification `SUSPICIOUS`
-  5. `LOW_CONFIDENCE` — confidence < 0.6, otherwise
+  5. `LOW_CONFIDENCE` — confidence < 0.6, otherwise (also skipped in the same zero-evidence/complete-coverage case)
 
 | # | risk | confidence | Decision | Reason |
 |---|---|---|---|---|
@@ -171,6 +171,15 @@ RiskAssessment → EscalationPolicy ──┬── Sufficient evidence ──�
 - High risk + high confidence never escalates (case 2) — already actionable.
 - Low risk + low confidence still escalates (case 5) — "probably safe" ≠ "we don't know."
 - `priority` derives from risk band alone. `recommended_next_stage` is `NONE`/`DEEP_ANALYSIS` only.
+
+## CLEAN vs INCOMPLETE detection coverage
+
+Zero evidence is ambiguous on its own, so `EscalationPolicy.evaluate()` resolves it using the existing `DetectionCoverage.is_complete` flag rather than a new model or duplicated state:
+
+- **CLEAN** — every detector ran successfully and still found nothing (`len(evidence) == 0 and coverage.is_complete`). This means "we looked, using every available deterministic mechanism, and found no suspicious signal" — not low confidence. `ConfidenceCalculator` returning `0.0` here is a definitional artifact (there is nothing to average), not a trust signal. **Zero evidence does not mean low confidence.** → `NO_ESCALATION`, agent not invoked.
+- **INCOMPLETE** — one or more detectors failed (`coverage.detectors_failed > 0`). Zero evidence here means "we don't know", not "clean". **A failed detector is not the same as a clean result.** → still escalates via `INSUFFICIENT_DETECTOR_COVERAGE`, unchanged.
+
+The agent/LLM investigation layer is an uncertainty-resolution mechanism for genuinely ambiguous or incomplete cases — not a default path every event passes through. This distinction exists partly to control unnecessary token/LLM usage: without it, every zero-signal benign event (a large share of real traffic) would trigger an agent investigation and, with `LLM_ENABLED=true`, a real billed LLM call, for no benefit.
 
 ## Agent Investigation Engine
 
@@ -335,7 +344,8 @@ tests/
 │   test_sender_analyzer.py, test_url_analyzer.py                # Phase 3-4
 ├── test_risk_*.py, test_classifier.py, test_confidence_calculator.py,
 │   test_scoring_policy.py, test_detection_pipeline.py            # Phase 5
-├── test_escalation_*.py, test_analysis_orchestrator.py           # Phase 6
+├── test_escalation_*.py, test_analysis_orchestrator.py,
+│   test_clean_vs_incomplete_detection.py                          # Phase 6
 ├── test_agent_*.py, test_orchestrator_agent_integration.py       # Phase 7
 └── test_llm_*.py, test_orchestrator_llm_integration.py           # Phase 8
 ```
@@ -358,6 +368,7 @@ Stub packages under `app/` contain only an `__init__.py` naming the phase that o
 - Confidence excludes severity (would entangle risk/confidence) and evidence diversity checks aren't duplicated in `EscalationPolicy` (already in `RiskAssessment.confidence`).
 - `DetectionPipeline`/`AnalysisOrchestrator` have no try/except — each stage already isolates its own failures; a failure at composition level is a real bug.
 - The agent is invoked only from `AnalysisOrchestrator`; `EscalationPolicy`/`RiskEngine` stay agent-unaware.
+- CLEAN vs INCOMPLETE reuses the existing `DetectionCoverage.is_complete` flag rather than a new `DetectionOutcome` model — the distinction was already representable without duplicated state.
 - `FakeAgentReasoner` reasons over structured tool data only, never rendered prompt text — makes injection structurally impossible.
 - Reassessment is gated on `recommended_reassessment`, not `ESCALATE` alone — avoids a duplicate assessment when nothing new is found.
 - `LLMReasoner` is a second `AgentReasoner`, not a replacement — `AgentInvestigationEngine`'s default stays `FakeAgentReasoner()`; `LLMReasoner` is opt-in via `build_reasoner(settings)`.

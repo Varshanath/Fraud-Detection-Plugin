@@ -218,18 +218,27 @@ SCENARIOS: list[Scenario] = [
 ]
 
 # Per-scenario verdicts, decided from the actual, empirically-observed
-# behavior of the unmodified pipeline (see the written report accompanying
-# this harness for the full rationale behind each one). Sub-columns can
-# legitimately diverge from the overall Result: Result reflects whether the
-# scenario's literal expected-behavior bullets were satisfied; the four
-# sub-columns expose finer-grained divergence even when Result is PASS.
+# behavior of the pipeline (see the written report accompanying this harness
+# for the full rationale behind each one). Sub-columns can legitimately
+# diverge from the overall Result: Result reflects whether the scenario's
+# literal expected-behavior bullets were satisfied; the four sub-columns
+# expose finer-grained divergence even when Result is PASS.
+#
+# Updated after the CLEAN vs INCOMPLETE detection-coverage fix to
+# EscalationPolicy.evaluate(): zero evidence from a fully successful
+# detection pass is now CLEAN and no longer escalates on its own. Before
+# that fix, Scenarios 1, 6, 7, and 8 (and, by the same mechanism, 4) were
+# marked EXPECTED_DIFFERENCE here because they escalated and invoked the
+# agent despite being genuinely clean/ambiguous-with-no-signal events; they
+# now match the originally-expected NO_ESCALATION / agent-not-invoked
+# behavior exactly, so they are PASS across every column.
 EXPECTED_VERDICTS: dict[str, dict[str, str]] = {
     "SCENARIO 1 - BENIGN EMAIL": {
         "Detection": "PASS",
         "Risk": "PASS",
-        "Escalation": "EXPECTED_DIFFERENCE",
-        "Agent": "EXPECTED_DIFFERENCE",
-        "Result": "EXPECTED_DIFFERENCE",
+        "Escalation": "PASS",
+        "Agent": "PASS",
+        "Result": "PASS",
     },
     "SCENARIO 2 - OBVIOUS PHISHING EMAIL": {
         "Detection": "PASS",
@@ -262,22 +271,22 @@ EXPECTED_VERDICTS: dict[str, dict[str, str]] = {
     "SCENARIO 6 - PROMPT INJECTION": {
         "Detection": "PASS",
         "Risk": "PASS",
-        "Escalation": "EXPECTED_DIFFERENCE",
+        "Escalation": "PASS",
         "Agent": "PASS",
         "Result": "PASS",
     },
     "SCENARIO 7 - FALSE POSITIVE: OTP INFORMATION": {
         "Detection": "PASS",
         "Risk": "PASS",
-        "Escalation": "EXPECTED_DIFFERENCE",
-        "Agent": "EXPECTED_DIFFERENCE",
+        "Escalation": "PASS",
+        "Agent": "PASS",
         "Result": "PASS",
     },
     "SCENARIO 8 - FALSE POSITIVE: SUCCESSFUL PAYMENT": {
         "Detection": "PASS",
         "Risk": "PASS",
-        "Escalation": "EXPECTED_DIFFERENCE",
-        "Agent": "EXPECTED_DIFFERENCE",
+        "Escalation": "PASS",
+        "Agent": "PASS",
         "Result": "PASS",
     },
 }
@@ -502,13 +511,14 @@ def main() -> None:
     print("1. False positives discovered")
     print(
         textwrap.fill(
-            "No classification-level false positive occurred: every genuinely benign "
-            "event (Scenarios 1, 7, 8) stayed at risk_score=0 / SAFE / ALLOW. However, "
-            "there is a process-level false positive: EscalationPolicy's "
-            "min_evidence_count=1 combined with ConfidenceCalculator returning 0.0 "
-            "confidence for zero counted evidence means every zero-evidence event -- "
-            "benign or not -- escalates via INSUFFICIENT_EVIDENCE/LOW_CONFIDENCE and "
-            "invokes the agent (observed in Scenarios 1, 4, 6, 7, 8: 5 of 8 runs).",
+            "None. Every genuinely benign event (Scenarios 1, 7, 8) stays at "
+            "risk_score=0 / SAFE / ALLOW, and -- since the CLEAN vs INCOMPLETE fix to "
+            "EscalationPolicy.evaluate() -- now also resolves to NO_ESCALATION with the "
+            "agent not invoked. The previously-observed process-level false positive "
+            "(zero-evidence events unnecessarily escalating and invoking the agent, "
+            "seen in Scenarios 1, 4, 6, 7, 8 before this fix) is gone: zero evidence "
+            "from a fully successful detection pass is now treated as CLEAN rather than "
+            "as insufficient/low-confidence evidence.",
             width=78,
         )
     )
@@ -536,12 +546,12 @@ def main() -> None:
     print("3. Unexpected escalation")
     print(
         textwrap.fill(
-            "Every zero-evidence event in this batch escalates -- including the plainly "
-            "benign meeting email (Scenario 1) and both false-positive-bait messages "
-            "(Scenarios 7, 8). This is 'expected' only in the narrow sense that it is "
-            "exactly what the current EscalationPolicy/ConfidenceCalculator combination "
-            "produces (and is what the existing Phase 6-8 test suite already assumes); "
-            "it is very likely unexpected relative to real deployment intent.",
+            "None observed in this batch. Zero-evidence events with fully successful "
+            "detection coverage (Scenarios 1, 4, 6, 7, 8) now correctly resolve to "
+            "NO_ESCALATION (CLEAN/no signal), while zero-evidence events with a failed "
+            "detector still escalate via INSUFFICIENT_DETECTOR_COVERAGE exactly as "
+            "before -- see tests/test_clean_vs_incomplete_detection.py, which exercises "
+            "both cases directly.",
             width=78,
         )
     )
@@ -550,10 +560,11 @@ def main() -> None:
     print("4. Cases where the agent was invoked unnecessarily")
     print(
         textwrap.fill(
-            "Scenarios 1, 4, 6, 7, and 8 all invoke FakeAgentReasoner for events carrying "
-            "zero underlying evidence. In every one of those cases the agent produced no "
-            "additional_evidence and recommended_reassessment=False -- it ran, and added "
-            "no value beyond confirming the null result, 5 out of 8 times in this batch.",
+            "None observed in this batch. Scenarios 1, 4, 6, 7, and 8 previously invoked "
+            "FakeAgentReasoner for events carrying zero underlying evidence, producing no "
+            "additional_evidence and no reassessment in every case -- pure overhead. "
+            "After the CLEAN vs INCOMPLETE fix, none of those five scenarios invoke the "
+            "agent at all.",
             width=78,
         )
     )
@@ -577,15 +588,15 @@ def main() -> None:
     print("6. Architectural problems discovered")
     print(
         textwrap.fill(
-            "The interaction between ConfidenceCalculator (0.0 confidence for zero "
-            "evidence, not a high 'nothing suspicious found' confidence) and "
-            "EscalationPolicy's min_evidence_count=1 floor means 'no evidence found "
-            "because the message is clean' and 'no evidence found because detection "
-            "coverage/vocabulary is insufficient' are indistinguishable -- the policy has "
-            "no way to express the former as anything but LOW_CONFIDENCE/ESCALATE. This "
-            "is a genuine gap between Phase 5 (RiskEngine) and Phase 6 (EscalationPolicy), "
-            "not a defect in either component considered alone -- each behaves exactly as "
-            "documented and as its own unit tests already verify. No other structural "
+            "The gap previously found here -- EscalationPolicy could not distinguish "
+            "'no evidence because the message is clean' from 'no evidence because "
+            "detection coverage is insufficient', since both produced 0.0 confidence and "
+            "the same INSUFFICIENT_EVIDENCE/LOW_CONFIDENCE reasons -- has been fixed: "
+            "EscalationPolicy.evaluate() now short-circuits to CLEAN/NO_ESCALATION only "
+            "when evidence is empty AND every detector succeeded (coverage.is_complete), "
+            "reusing the existing DetectionCoverage model rather than introducing new "
+            "state. A failed detector still forces escalation via "
+            "INSUFFICIENT_DETECTOR_COVERAGE regardless of this flag. No other structural "
             "problems were found: prompt-injection resistance holds end-to-end "
             f"(Scenario 6 -- tool registry, reasoner type, and evidence stayed unaffected "
             f"by the injected instructions), the agent is correctly skipped when confidence "
@@ -611,17 +622,19 @@ def main() -> None:
     else:
         print(
             textwrap.fill(
-                "Yes, conditionally. The deterministic pipeline, escalation gate, tool "
-                "boundary, and FakeAgentReasoner all behaved consistently and safely "
-                "across all 8 scenarios, including the adversarial one, so the seam "
-                "LLMReasoner (Phase 8) plugs into is exercised and sound. Recommend first "
-                "deciding whether the zero-evidence-escalates artifact (finding #1/#3) is "
-                "acceptable: as-is, most clean/benign traffic in a real deployment would "
-                "trigger a real, billed LLM call for no benefit. Also keep finding #2 in "
-                "mind when interpreting any real-LLM run over financial-scam content -- the "
-                "agent (fake or real) reasons over already-executed tool output, not raw "
-                "free text, so a rule-level detection miss will not be silently recovered "
-                "by the LLM.",
+                "Yes. The deterministic pipeline, escalation gate, tool boundary, and "
+                "FakeAgentReasoner all behaved consistently and safely across all 8 "
+                "scenarios, including the adversarial one, so the seam LLMReasoner "
+                "(Phase 8) plugs into is exercised and sound. The zero-evidence-escalates "
+                "artifact that previously meant most clean/benign traffic would trigger a "
+                "real, billed LLM call for no benefit is now fixed (see finding #1/#3/#6): "
+                "clean events no longer reach the agent boundary at all. The one remaining "
+                "caveat is finding #2 -- Scenario 3's financial-scam wording evades the "
+                "deterministic rules, so it never reaches the agent as evidence either; a "
+                "real LLM run over that content will not silently recover a rule-level "
+                "detection miss, since the agent reasons over already-executed tool "
+                "output, not raw free text. That is a detection-coverage question, not a "
+                "blocker for LLM testing itself.",
                 width=78,
             )
         )
